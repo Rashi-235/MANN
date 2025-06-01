@@ -1,0 +1,576 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+import math
+
+class MemoryBank(nn.Module):
+    """
+    External memory bank for storing hydrological patterns 
+    """
+    def __init__(self, memory_size, memory_dim, num_heads=4):
+        super(MemoryBank, self).__init__()
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        self.num_heads = num_heads
+        
+        # Initialize memory bank
+        self.memory = nn.Parameter(torch.randn(memory_size, memory_dim))
+        # Usage tracking as buffer (not parameter)
+        self.register_buffer('usage', torch.zeros(memory_size))
+        
+        # Memory interaction layers
+        self.query_proj = nn.Linear(memory_dim, memory_dim)
+        self.key_proj = nn.Linear(memory_dim, memory_dim)
+        self.value_proj = nn.Linear(memory_dim, memory_dim)
+        
+    def read(self, query, top_k=5):
+        """
+        Read from memory using attention mechanism
+        """
+        batch_size = query.size(0)
+        
+        # Compute attention weights
+        q = self.query_proj(query)  # [batch_size, memory_dim]
+        k = self.key_proj(self.memory)  # [memory_size, memory_dim]
+        
+        # Compute similarity scores
+        scores = torch.matmul(q, k.transpose(0, 1))  # [batch_size, memory_size]
+        attention_weights = F.softmax(scores / math.sqrt(self.memory_dim), dim=-1)
+        
+        # Read values
+        v = self.value_proj(self.memory)  # [memory_size, memory_dim]
+        read_content = torch.matmul(attention_weights, v)  # [batch_size, memory_dim]
+        
+        return read_content, attention_weights
+    
+    def write(self, content, gate=None):
+        """
+        Write new patterns to memory with usage-based replacement - FIXED VERSION
+        """
+        if gate is None:
+            gate = torch.sigmoid(torch.randn(1, device=content.device))
+        
+        # Find least used memory slot
+        _, least_used_idx = torch.min(self.usage, dim=0)
+        
+        # FIXED: Update memory using torch.no_grad() to avoid in-place operation error
+        with torch.no_grad():
+            # Use .data to access underlying storage without gradient tracking
+            self.memory.data[least_used_idx] = gate * content + (1 - gate) * self.memory.data[least_used_idx]
+            self.usage[least_used_idx] += 1
+        
+        return least_used_idx
+
+class PositionalEncoding(nn.Module):
+    """
+    Positional encoding for temporal sequences with seasonal awareness
+    """
+    def __init__(self, d_model, max_len=5000, seasonal_period=365):
+        super(PositionalEncoding, self).__init__()
+        self.seasonal_period = seasonal_period
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        
+        # Standard positional encoding
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                           (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Seasonal encoding
+        seasonal_div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
+                                    (-math.log(seasonal_period) / d_model))
+        pe[:, 0::2] += 0.1 * torch.sin(position * seasonal_div_term)
+        pe[:, 1::2] += 0.1 * torch.cos(position * seasonal_div_term)
+        
+        self.register_buffer('pe', pe.unsqueeze(0))
+    
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, d_model] when batch_first=True
+        return x + self.pe[:, :x.size(1), :]
+
+class MANNTransformerEncoder(nn.Module):
+    """
+    Memory-Augmented Transformer Encoder for hydrological modeling
+    """
+    def __init__(self, d_model, nhead, num_layers, memory_size, memory_dim, 
+                 dropout=0.1, activation='relu'):
+        super(MANNTransformerEncoder, self).__init__()
+        self.d_model = d_model
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        
+        # Memory bank
+        self.memory_bank = MemoryBank(memory_size, memory_dim, nhead)
+        
+        # FIXED: Transformer layers with batch_first=True to avoid warning
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model, nhead, dim_feedforward=4*d_model, 
+            dropout=dropout, activation=activation, batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        
+        # Memory integration layers
+        self.memory_gate = nn.Linear(d_model + memory_dim, d_model)
+        self.memory_proj = nn.Linear(d_model, memory_dim)
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model)
+        
+    def forward(self, src, src_mask=None):
+        """
+        Forward pass with memory-augmented attention 
+        """
+        batch_size, seq_len, _ = src.size()
+        
+        # Add positional encoding
+        src = self.pos_encoder(src)  # [batch_size, seq_len, d_model]
+        
+        # Standard transformer encoding with batch_first=True
+        encoded = self.transformer_encoder(src, src_mask)  # [batch_size, seq_len, d_model]
+        
+        # Memory interaction for each timestep
+        memory_enhanced = []
+        for t in range(seq_len):
+            # Project current state to memory space
+            current_state = encoded[:, t, :]  # [batch_size, d_model]
+            memory_query = self.memory_proj(current_state)
+            
+            # Read from memory
+            memory_content, attention_weights = self.memory_bank.read(memory_query)
+            
+            # Combine with current state
+            combined = torch.cat([current_state, memory_content], dim=-1)
+            enhanced_state = self.memory_gate(combined)
+            memory_enhanced.append(enhanced_state)
+        
+        memory_enhanced = torch.stack(memory_enhanced, dim=1)  # [batch_size, seq_len, d_model]
+        
+        return memory_enhanced, attention_weights
+
+class DischargePredictor(nn.Module):
+    """
+    Complete MANN-Transformer model for discharge prediction
+    """
+    def __init__(self, input_dim, d_model=256, nhead=8, num_layers=6, 
+                 memory_size=100, memory_dim=128, output_dim=1, dropout=0.1):
+        super(DischargePredictor, self).__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        
+        # Input projection
+        self.input_projection = nn.Linear(input_dim, d_model)
+        
+        # MANN-Transformer encoder
+        self.mann_transformer = MANNTransformerEncoder(
+            d_model, nhead, num_layers, memory_size, memory_dim, dropout
+        )
+        
+        # Output layers
+        self.output_projection = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, d_model // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 4, output_dim)
+        )
+        
+        # Uncertainty estimation
+        self.uncertainty_head = nn.Linear(d_model, output_dim)
+        
+    def forward(self, x, return_attention=False):
+        """
+        Forward pass for discharge prediction
+        """
+        batch_size, seq_len, _ = x.size()
+        
+        # Project input to model dimension
+        x_projected = self.input_projection(x)
+        
+        # MANN-Transformer encoding
+        encoded, attention_weights = self.mann_transformer(x_projected)
+        
+        # Use final timestep for prediction
+        final_state = encoded[:, -1, :]  # [batch_size, d_model]
+        
+        # Discharge prediction
+        discharge_pred = self.output_projection(final_state)
+        
+        # Uncertainty estimation
+        uncertainty = torch.exp(self.uncertainty_head(final_state))
+        
+        if return_attention:
+            return discharge_pred, uncertainty, attention_weights
+        return discharge_pred, uncertainty
+
+# class HydrologicalDataset(Dataset):
+#     """
+#     Dataset class for hydrological time series with few-shot learning support
+#     """
+#     def __init__(self, data, sequence_length=30, prediction_horizon=1, 
+#                  support_size=5, query_size=15):
+#         self.data = data
+#         self.sequence_length = sequence_length
+#         self.prediction_horizon = prediction_horizon
+#         self.support_size = support_size
+#         self.query_size = query_size
+        
+#         # Prepare features and targets
+#         self.prepare_data()
+        
+#     def prepare_data(self):
+#         """
+#         Prepare time series data with seasonal and trend features
+#         """
+#         # Extract date features
+#         self.data['day_of_year'] = self.data.index.dayofyear / 365.0
+#         self.data['month'] = self.data.index.month / 12.0
+#         self.data['season_sin'] = np.sin(2 * np.pi * self.data.index.dayofyear / 365.0)
+#         self.data['season_cos'] = np.cos(2 * np.pi * self.data.index.dayofyear / 365.0)
+        
+#         # Lag features for autoregressive component
+#         for lag in [1, 7, 30, 365]:
+#             self.data[f'discharge_lag_{lag}'] = self.data['Discharge(m3/s)'].shift(lag)
+        
+#         # Rolling statistics
+#         for window in [7, 30]:
+#             self.data[f'discharge_mean_{window}'] = self.data['Discharge(m3/s)'].rolling(window).mean()
+#             self.data[f'discharge_std_{window}'] = self.data['Discharge(m3/s)'].rolling(window).std()
+        
+#         # Remove rows with NaN values
+#         self.data = self.data.dropna()
+        
+#         # Feature columns
+#         self.feature_cols = [col for col in self.data.columns if col != 'Discharge(m3/s)']
+        
+#     def __len__(self):
+#         return len(self.data) - self.sequence_length - self.prediction_horizon + 1
+    
+#     def __getitem__(self, idx):
+#         """
+#         Get a sequence for few-shot learning
+#         """
+#         # Extract sequence
+#         start_idx = idx
+#         end_idx = start_idx + self.sequence_length
+        
+#         # Features
+#         features = self.data[self.feature_cols].iloc[start_idx:end_idx].values
+        
+#         # Target
+#         target_idx = end_idx + self.prediction_horizon - 1
+#         target = self.data['Discharge(m3/s)'].iloc[target_idx]
+        
+#         return torch.FloatTensor(features), torch.FloatTensor([target])
+    
+#     def get_few_shot_batch(self, num_tasks=1):
+#         """
+#         Generate few-shot learning batches
+#         """
+#         tasks = []
+#         for _ in range(num_tasks):
+#             # Randomly sample support and query sets
+#             total_needed = self.support_size + self.query_size
+#             if len(self) < total_needed:
+#                 continue
+                
+#             indices = np.random.choice(len(self), total_needed, replace=False)
+#             support_indices = indices[:self.support_size]
+#             query_indices = indices[self.support_size:]
+            
+#             # Get support set
+#             support_x = []
+#             support_y = []
+#             for idx in support_indices:
+#                 x, y = self[idx]
+#                 support_x.append(x)
+#                 support_y.append(y)
+            
+#             # Get query set
+#             query_x = []
+#             query_y = []
+#             for idx in query_indices:
+#                 x, y = self[idx]
+#                 query_x.append(x)
+#                 query_y.append(y)
+            
+#             tasks.append({
+#                 'support_x': torch.stack(support_x),
+#                 'support_y': torch.stack(support_y),
+#                 'query_x': torch.stack(query_x),
+#                 'query_y': torch.stack(query_y)
+#             })
+        
+#         return tasks
+
+class HydrologicalDataset(Dataset):
+    """
+    Dataset class for hydrological time series with few-shot learning support
+    Now returns (features, target, target_date).
+    """
+    def __init__(self, data, sequence_length=30, prediction_horizon=1, 
+                 support_size=5, query_size=15):
+        self.data = data
+        self.sequence_length = sequence_length
+        self.prediction_horizon = prediction_horizon
+        self.support_size = support_size
+        self.query_size = query_size
+        
+        # Prepare features and targets
+        self.prepare_data()
+        
+    def prepare_data(self):
+        """
+        Prepare time series data with seasonal and trend features
+        """
+        # Extract date features
+        self.data['day_of_year'] = self.data.index.dayofyear / 365.0
+        self.data['month'] = self.data.index.month / 12.0
+        self.data['season_sin'] = np.sin(2 * np.pi * self.data.index.dayofyear / 365.0)
+        self.data['season_cos'] = np.cos(2 * np.pi * self.data.index.dayofyear / 365.0)
+        
+        # Lag features
+        for lag in [1, 7, 30, 365]:
+            self.data[f'discharge_lag_{lag}'] = self.data['Discharge(m3/s)'].shift(lag)
+        
+        # Rolling statistics
+        for window in [7, 30]:
+            self.data[f'discharge_mean_{window}'] = (
+                self.data['Discharge(m3/s)'].rolling(window).mean()
+            )
+            self.data[f'discharge_std_{window}'] = (
+                self.data['Discharge(m3/s)'].rolling(window).std()
+            )
+        
+        # Remove rows with NaN
+        self.data = self.data.dropna()
+        
+        # Feature columns
+        self.feature_cols = [col for col in self.data.columns if col != 'Discharge(m3/s)']
+        
+    def __len__(self):
+        return len(self.data) - self.sequence_length - self.prediction_horizon + 1
+    
+    def __getitem__(self, idx):
+        """
+        Return (features, target, target_date) for the window starting at idx.
+        """
+        start_idx = idx
+        end_idx = start_idx + self.sequence_length
+        
+        # Features (shape: [sequence_length, num_features])
+        features = self.data[self.feature_cols].iloc[start_idx:end_idx].values
+        
+        # Target index (one step ahead by prediction_horizon)
+        target_idx = end_idx + self.prediction_horizon - 1
+        target = self.data['Discharge(m3/s)'].iloc[target_idx]  # this is log1p(discharge)
+        
+        # Also grab the corresponding date label
+        target_date = self.data.index[target_idx]
+        
+        return (
+            torch.FloatTensor(features),
+            torch.FloatTensor([target]),
+            target_date
+        )
+    
+    def get_few_shot_batch(self, num_tasks=1):
+        """
+        Generate few-shot tasks: each task returns support_x, support_y, support_dates,
+        and query_x, query_y, query_dates.
+        """
+        tasks = []
+        for _ in range(num_tasks):
+            total_needed = self.support_size + self.query_size
+            if len(self) < total_needed:
+                continue
+                
+            indices = np.random.choice(len(self), total_needed, replace=False)
+            support_indices = indices[:self.support_size]
+            query_indices   = indices[self.support_size:]
+            
+            # Support set
+            support_x, support_y, support_dates = [], [], []
+            for i in support_indices:
+                x, y, dt = self[i]
+                support_x.append(x)
+                support_y.append(y)
+                support_dates.append(dt)
+            
+            # Query set
+            query_x, query_y, query_dates = [], [], []
+            for i in query_indices:
+                x, y, dt = self[i]
+                query_x.append(x)
+                query_y.append(y)
+                query_dates.append(dt)
+            
+            tasks.append({
+                'support_x'     : torch.stack(support_x),
+                'support_y'     : torch.stack(support_y),
+                'support_dates' : support_dates,
+                'query_x'       : torch.stack(query_x),
+                'query_y'       : torch.stack(query_y),
+                'query_dates'   : query_dates
+            })
+        
+        return tasks
+
+
+def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32, 
+                          learning_rate=1e-4, device='cpu'):
+    """
+    Training loop that also prints, for each query example:
+      - the date,
+      - the actual (raw) discharge,
+      - the predicted (raw) discharge,
+      along with the batch loss.
+    """
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU instead")
+        device = 'cpu'
+    
+    model = model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    
+    mse_loss = nn.MSELoss()
+    train_losses = []
+    memory_write_frequency = 10
+    
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_losses = []
+        
+        few_shot_batches = dataset.get_few_shot_batch(num_tasks=batch_size)
+        for batch_idx, task in enumerate(few_shot_batches):
+            optimizer.zero_grad()
+            
+            # --- Support set forward pass (for memory writes) ---
+            support_x = task['support_x'].to(device)       # [support_size, seq_len, features]
+            support_y = task['support_y'].to(device)       # [support_size, 1]
+            _, _, support_attention = model(support_x, return_attention=True)
+            
+            if batch_idx % memory_write_frequency == 0:
+                with torch.no_grad():
+                    support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
+                    for i in range(min(support_repr.size(0), 5)):
+                        model.mann_transformer.memory_bank.write(support_repr[i])
+            
+            # --- Query set forward pass  ---
+            query_x = task['query_x'].to(device)    # [query_size, seq_len, features]
+            query_y = task['query_y'].to(device)    # [query_size, 1]
+            query_dates = task['query_dates']       # list of length query_size
+            
+            query_pred, query_uncertainty = model(query_x)
+            
+            # Compute losses
+            support_loss     = mse_loss(_, _.detach())  # we don’t need support_pred here
+            query_loss       = mse_loss(query_pred.squeeze(), query_y.squeeze())
+            uncertainty_loss = torch.mean(query_uncertainty)
+            total_loss       = support_loss + query_loss + 0.1 * uncertainty_loss
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_losses.append(total_loss.item())
+            
+            # --- Print date + true vs. predicted in raw discharge units ---
+            # First convert tensors to 1D Python lists (values on log1p scale)
+            true_log1p  = query_y.squeeze().detach().cpu().numpy().tolist()      # each=log1p(true)
+            pred_log1p  = query_pred.squeeze().detach().cpu().numpy().tolist()   # each=log1p(pred)
+            
+            # Invert log1p to get raw discharge: expm1(log1p(val)) = val_raw
+            true_raw = [float(np.expm1(v)) for v in true_log1p]
+            pred_raw = [float(np.expm1(v)) for v in pred_log1p]
+            
+            print(f"Epoch {epoch}, Batch {batch_idx} — Loss: {total_loss.item():.6f}")
+            for i, dt in enumerate(query_dates):
+                # Format date as YYYY-MM-DD
+                date_str = dt.strftime("%Y-%m-%d")
+                print(f"    {date_str}  |  True: {true_raw[i]:.4f}  →  Pred: {pred_raw[i]:.4f}")
+            print("")  # blank line between batches
+        
+        scheduler.step()
+        avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+        train_losses.append(avg_loss)
+        print(f"Epoch {epoch} complete. Avg Loss: {avg_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}\n")
+    
+    return train_losses
+
+
+# Example usage with automatic device detection
+# def prepare_discharge_data(file_path):
+#     """
+#     Prepare the discharge data for MANN-Transformer training
+#     """
+#     # Load data
+#     data = pd.read_excel(file_path)
+#     data['Date'] = pd.to_datetime(data['Date'])
+#     data = data.set_index('Date')
+    
+#     # Handle missing values
+#     data['Discharge(m3/s)'] = data['Discharge(m3/s)'].fillna(0)
+    
+#     # Log transform for handling extreme values
+#     data['Discharge(m3/s)'] = np.log1p(data['Discharge(m3/s)'])
+    
+#     return data
+
+def prepare_discharge_data(file_path):
+    """
+    Prepare the discharge data for MANN-Transformer training
+    (now dropping any rows where 'Discharge(m3/s)' is NaN)
+    """
+    # Load data
+    data = pd.read_excel(file_path)
+    data['Date'] = pd.to_datetime(data['Date'])
+    data = data.set_index('Date')
+    
+    # Drop rows with missing discharge values
+    data = data.dropna(subset=['Discharge(m3/s)'])
+    
+    # Log-transform for handling extreme values
+    data['Discharge(m3/s)'] = np.log1p(data['Discharge(m3/s)'])
+    
+    return data
+
+
+# Main execution with error handling
+if __name__ == "__main__":
+        # Initialize model and dataset
+        data = prepare_discharge_data('DOC-20250406-WA0050..xlsx')
+        dataset = HydrologicalDataset(data, sequence_length=30, prediction_horizon=1)
+        
+        # Model configuration
+        input_dim = len(dataset.feature_cols)
+        model = DischargePredictor(
+            input_dim=input_dim,
+            d_model=256,
+            nhead=8,
+            num_layers=6,
+            memory_size=100,
+            memory_dim=128,
+            output_dim=1
+        )
+        
+        # Automatic device detection
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        
+        # Training with fixed implementation
+        train_losses = train_mann_transformer(model, dataset, num_epochs=20, device=device)
+        
+        print("Training completed successfully!")
+        print(f"Final loss: {train_losses[-1]:.6f}")
+        
+    # except Exception as e:
+    #     print(f"An error occurred: {e}")
+    #     print("Please check your data file path and ensure all dependencies are installed.")
