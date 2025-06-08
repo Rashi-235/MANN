@@ -8,63 +8,63 @@ import math
 from torch.nn import HuberLoss
 
 
-class MemoryBank(nn.Module):
-    """
-    External memory bank for storing hydrological patterns 
-    """
-    def __init__(self, memory_size, memory_dim, num_heads=4):
-        super(MemoryBank, self).__init__()
-        self.memory_size = memory_size
-        self.memory_dim = memory_dim
-        self.num_heads = num_heads
+# class MemoryBank(nn.Module):
+#     """
+#     External memory bank for storing hydrological patterns 
+#     """
+#     def __init__(self, memory_size, memory_dim, num_heads=4):
+#         super(MemoryBank, self).__init__()
+#         self.memory_size = memory_size
+#         self.memory_dim = memory_dim
+#         self.num_heads = num_heads
         
-        # Initialize memory bank
-        self.memory = nn.Parameter(torch.randn(memory_size, memory_dim))
-        # Usage tracking as buffer (not parameter)
-        self.register_buffer('usage', torch.zeros(memory_size))
+#         # Initialize memory bank
+#         self.memory = nn.Parameter(torch.randn(memory_size, memory_dim))
+#         # Usage tracking as buffer (not parameter)
+#         self.register_buffer('usage', torch.zeros(memory_size))
         
-        # Memory interaction layers
-        self.query_proj = nn.Linear(memory_dim, memory_dim)
-        self.key_proj = nn.Linear(memory_dim, memory_dim)
-        self.value_proj = nn.Linear(memory_dim, memory_dim)
+#         # Memory interaction layers
+#         self.query_proj = nn.Linear(memory_dim, memory_dim)
+#         self.key_proj = nn.Linear(memory_dim, memory_dim)
+#         self.value_proj = nn.Linear(memory_dim, memory_dim)
         
-    def read(self, query, top_k=5):
-        """
-        Read from memory using attention mechanism
-        """
-        batch_size = query.size(0)
+#     def read(self, query, top_k=5):
+#         """
+#         Read from memory using attention mechanism
+#         """
+#         batch_size = query.size(0)
         
-        # Compute attention weights
-        q = self.query_proj(query)  # [batch_size, memory_dim]
-        k = self.key_proj(self.memory)  # [memory_size, memory_dim]
+#         # Compute attention weights
+#         q = self.query_proj(query)  # [batch_size, memory_dim]
+#         k = self.key_proj(self.memory)  # [memory_size, memory_dim]
         
-        # Compute similarity scores
-        scores = torch.matmul(q, k.transpose(0, 1))  # [batch_size, memory_size]
-        attention_weights = F.softmax(scores / math.sqrt(self.memory_dim), dim=-1)
+#         # Compute similarity scores
+#         scores = torch.matmul(q, k.transpose(0, 1))  # [batch_size, memory_size]
+#         attention_weights = F.softmax(scores / math.sqrt(self.memory_dim), dim=-1)
         
-        # Read values
-        v = self.value_proj(self.memory)  # [memory_size, memory_dim]
-        read_content = torch.matmul(attention_weights, v)  # [batch_size, memory_dim]
+#         # Read values
+#         v = self.value_proj(self.memory)  # [memory_size, memory_dim]
+#         read_content = torch.matmul(attention_weights, v)  # [batch_size, memory_dim]
         
-        return read_content, attention_weights
+#         return read_content, attention_weights
     
-    def write(self, content, gate=None):
-        """
-        Write new patterns to memory with usage-based replacement
-        """
-        if gate is None:
-            gate = torch.sigmoid(torch.randn(1, device=content.device))
+#     def write(self, content, gate=None):
+#         """
+#         Write new patterns to memory with usage-based replacement
+#         """
+#         if gate is None:
+#             gate = torch.sigmoid(torch.randn(1, device=content.device))
         
-        # Find least used memory slot
-        _, least_used_idx = torch.min(self.usage, dim=0)
+#         # Find least used memory slot
+#         _, least_used_idx = torch.min(self.usage, dim=0)
         
-        # FIXED: Update memory using torch.no_grad() to avoid in-place operation error
-        with torch.no_grad():
-            # Use .data to access underlying storage without gradient tracking
-            self.memory.data[least_used_idx] = gate * content + (1 - gate) * self.memory.data[least_used_idx]
-            self.usage[least_used_idx] += 1
+#         # FIXED: Update memory using torch.no_grad() to avoid in-place operation error
+#         with torch.no_grad():
+#             # Use .data to access underlying storage without gradient tracking
+#             self.memory.data[least_used_idx] = gate * content + (1 - gate) * self.memory.data[least_used_idx]
+#             self.usage[least_used_idx] += 1
         
-        return least_used_idx
+#         return least_used_idx
 
 class PositionalEncoding(nn.Module):
     """
@@ -99,15 +99,15 @@ class MANNTransformerEncoder(nn.Module):
     """
     Memory-Augmented Transformer Encoder for hydrological modeling
     """
-    def __init__(self, d_model, nhead, num_layers, memory_size, memory_dim, 
+    def __init__(self, d_model, nhead, num_layers, 
                  dropout=0.1, activation='relu'):
         super(MANNTransformerEncoder, self).__init__()
         self.d_model = d_model
-        self.memory_size = memory_size
-        self.memory_dim = memory_dim
+        # self.memory_size = memory_size
+        # self.memory_dim = memory_dim
         
-        # Memory bank
-        self.memory_bank = MemoryBank(memory_size, memory_dim, nhead)
+        # # Memory bank
+        # self.memory_bank = MemoryBank(memory_size, memory_dim, nhead)
         
         # FIXED: Transformer layers with batch_first=True to avoid warning
         encoder_layer = nn.TransformerEncoderLayer(
@@ -117,8 +117,8 @@ class MANNTransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
         # Memory integration layers
-        self.memory_gate = nn.Linear(d_model + memory_dim, d_model)
-        self.memory_proj = nn.Linear(d_model, memory_dim)
+        # self.memory_gate = nn.Linear(d_model + memory_dim, d_model)
+        # self.memory_proj = nn.Linear(d_model, memory_dim)
         
         # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model)
@@ -127,32 +127,9 @@ class MANNTransformerEncoder(nn.Module):
         """
         Forward pass with memory-augmented attention 
         """
-        batch_size, seq_len, _ = src.size()
-        
-        # Add positional encoding
-        src = self.pos_encoder(src)  # [batch_size, seq_len, d_model]
-        
-        # Standard transformer encoding with batch_first=True
-        encoded = self.transformer_encoder(src, src_mask)  # [batch_size, seq_len, d_model]
-        
-        # Memory interaction for each timestep
-        memory_enhanced = []
-        for t in range(seq_len):
-            # Project current state to memory space
-            current_state = encoded[:, t, :]  # [batch_size, d_model]
-            memory_query = self.memory_proj(current_state)
-            
-            # Read from memory
-            memory_content, attention_weights = self.memory_bank.read(memory_query)
-            
-            # Combine with current state
-            combined = torch.cat([current_state, memory_content], dim=-1)
-            enhanced_state = self.memory_gate(combined)
-            memory_enhanced.append(enhanced_state)
-        
-        memory_enhanced = torch.stack(memory_enhanced, dim=1)  # [batch_size, seq_len, d_model]
-        
-        return memory_enhanced, attention_weights
+        src = self.pos_encoder(src)
+        encoded = self.transformer_encoder(src, src_mask)
+        return encoded, None 
 
 class DischargePredictor(nn.Module):
     """
@@ -168,9 +145,12 @@ class DischargePredictor(nn.Module):
         self.input_projection = nn.Linear(input_dim, d_model)
         
         # MANN-Transformer encoder
+        # self.mann_transformer = MANNTransformerEncoder(
+        #     d_model, nhead, num_layers, memory_size, memory_dim, dropout
+        # )
         self.mann_transformer = MANNTransformerEncoder(
-            d_model, nhead, num_layers, memory_size, memory_dim, dropout
-        )
+    d_model, nhead, num_layers, dropout
+)
         
         # Output layers
         self.output_projection = nn.Sequential(
@@ -273,7 +253,8 @@ class HydrologicalDataset(Dataset):
         self.data['month'] = self.data.index.month / 12.0
         self.data['season_sin'] = np.sin(2 * np.pi * self.data.index.dayofyear / 365.0)
         self.data['season_cos'] = np.cos(2 * np.pi * self.data.index.dayofyear / 365.0)
-        
+        self.data['discharge_diff_1'] = self.data['Discharge(m3/s)'].diff(1)
+        self.data['discharge_rolling_3'] = self.data['Discharge(m3/s)'].rolling(3).mean()
         # Lag features
         for lag in [1, 7, 30, 365]:
             self.data[f'discharge_lag_{lag}'] = self.data['Discharge(m3/s)'].shift(lag)
@@ -404,11 +385,11 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
             support_y = task['support_y'].to(device)       # [support_size, 1]
             _, _, support_attention = model(support_x, return_attention=True)
             
-            if batch_idx % memory_write_frequency == 0:
-                with torch.no_grad():
-                    support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
-                    for i in range(min(support_repr.size(0), 5)):
-                        model.mann_transformer.memory_bank.write(support_repr[i])
+            # if batch_idx % memory_write_frequency == 0:
+            #     with torch.no_grad():
+            #         support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
+            #         for i in range(min(support_repr.size(0), 5)):
+            #             model.mann_transformer.memory_bank.write(support_repr[i])
             
             # --- Query set forward pass  ---
             query_x = task['query_x'].to(device)    # [query_size, seq_len, features]
