@@ -8,108 +8,95 @@ import math
 from torch.nn import HuberLoss
 
 
-# class MemoryBank(nn.Module):
-#     """
-#     External memory bank for storing hydrological patterns 
-#     """
-#     def __init__(self, memory_size, memory_dim, num_heads=4):
-#         super(MemoryBank, self).__init__()
-#         self.memory_size = memory_size
-#         self.memory_dim = memory_dim
-#         self.num_heads = num_heads
-        
-#         # Initialize memory bank
-#         self.memory = nn.Parameter(torch.randn(memory_size, memory_dim))
-#         # Usage tracking as buffer (not parameter)
-#         self.register_buffer('usage', torch.zeros(memory_size))
-        
-#         # Memory interaction layers
-#         self.query_proj = nn.Linear(memory_dim, memory_dim)
-#         self.key_proj = nn.Linear(memory_dim, memory_dim)
-#         self.value_proj = nn.Linear(memory_dim, memory_dim)
-        
-#     def read(self, query, top_k=5):
-#         """
-#         Read from memory using attention mechanism
-#         """
-#         batch_size = query.size(0)
-        
-#         # Compute attention weights
-#         q = self.query_proj(query)  # [batch_size, memory_dim]
-#         k = self.key_proj(self.memory)  # [memory_size, memory_dim]
-        
-#         # Compute similarity scores
-#         scores = torch.matmul(q, k.transpose(0, 1))  # [batch_size, memory_size]
-#         attention_weights = F.softmax(scores / math.sqrt(self.memory_dim), dim=-1)
-        
-#         # Read values
-#         v = self.value_proj(self.memory)  # [memory_size, memory_dim]
-#         read_content = torch.matmul(attention_weights, v)  # [batch_size, memory_dim]
-        
-#         return read_content, attention_weights
-    
-#     def write(self, content, gate=None):
-#         """
-#         Write new patterns to memory with usage-based replacement
-#         """
-#         if gate is None:
-#             gate = torch.sigmoid(torch.randn(1, device=content.device))
-        
-#         # Find least used memory slot
-#         _, least_used_idx = torch.min(self.usage, dim=0)
-        
-#         # FIXED: Update memory using torch.no_grad() to avoid in-place operation error
-#         with torch.no_grad():
-#             # Use .data to access underlying storage without gradient tracking
-#             self.memory.data[least_used_idx] = gate * content + (1 - gate) * self.memory.data[least_used_idx]
-#             self.usage[least_used_idx] += 1
-        
-#         return least_used_idx
+class T2V(nn.Module):
+    """
+    Time-to-Vector embedding replacing fixed positional encoding.
+    Produces a learned sinusoidal embedding of a scalar time index.
+    """
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.output_dim = output_dim
+        self.W = None
+        self.P = None
 
-class PositionalEncoding(nn.Module):
+    def build(self, seq_len: int):
+        # W: maps scalar to output_dim features
+        self.W = nn.Parameter(torch.empty(1, self.output_dim))
+        # P: per-position phase offset [seq_len, output_dim]
+        self.P = nn.Parameter(torch.empty(seq_len, self.output_dim))
+        nn.init.uniform_(self.W)
+        nn.init.uniform_(self.P)
+
+    def forward(self, x: torch.Tensor):
+        # x: [B, L, 1] scalar time index
+        B, L, _ = x.shape
+        if self.W is None:
+            self.build(L)
+        # x @ W: [B, L, output_dim]
+        proj = x @ self.W  # broadcast multiplication
+        # add phase P: [L, output_dim] -> broadcast to [B, L, output_dim]
+        sin_in = proj + self.P.unsqueeze(0)
+        return torch.sin(sin_in)
+
+
+class MemoryBank(nn.Module):
     """
-    Positional encoding for temporal sequences with seasonal awareness
+    External memory bank for storing hydrological patterns 
     """
-    def __init__(self, d_model, max_len=5000, seasonal_period=365):
-        super(PositionalEncoding, self).__init__()
-        self.seasonal_period = seasonal_period
+    def __init__(self, memory_size, memory_dim, num_heads=4):
+        super(MemoryBank, self).__init__()
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
+        self.num_heads = num_heads
         
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        # Initialize memory bank
+        self.memory = nn.Parameter(torch.randn(memory_size, memory_dim))
+        self.register_buffer('usage', torch.zeros(memory_size))
         
-        # Standard positional encoding
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
-                           (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        # Memory interaction layers
+        self.query_proj = nn.Linear(memory_dim, memory_dim)
+        self.key_proj = nn.Linear(memory_dim, memory_dim)
+        self.value_proj = nn.Linear(memory_dim, memory_dim)
         
-        # Seasonal encoding
-        seasonal_div_term = torch.exp(torch.arange(0, d_model, 2).float() * 
-                                    (-math.log(seasonal_period) / d_model))
-        pe[:, 0::2] += 0.1 * torch.sin(position * seasonal_div_term)
-        pe[:, 1::2] += 0.1 * torch.cos(position * seasonal_div_term)
-        
-        self.register_buffer('pe', pe.unsqueeze(0))
+    def read(self, query, top_k=5):
+        batch_size = query.size(0)
+        q = self.query_proj(query)
+        k = self.key_proj(self.memory)
+        scores = torch.matmul(q, k.transpose(0, 1))
+        attention_weights = F.softmax(scores / math.sqrt(self.memory_dim), dim=-1)
+        v = self.value_proj(self.memory)
+        read_content = torch.matmul(attention_weights, v)
+        return read_content, attention_weights
     
-    def forward(self, x):
-        # x shape: [batch_size, seq_len, d_model] when batch_first=True
-        return x + self.pe[:, :x.size(1), :]
+    def write(self, content, gate=None):
+        if gate is None:
+            gate = torch.sigmoid(torch.randn(1, device=content.device))
+        _, least_used_idx = torch.min(self.usage, dim=0)
+        with torch.no_grad():
+            self.memory.data[least_used_idx] = (
+                gate * content + (1 - gate) * self.memory.data[least_used_idx]
+            )
+            self.usage[least_used_idx] += 1
+        return least_used_idx
+
 
 class MANNTransformerEncoder(nn.Module):
     """
-    Memory-Augmented Transformer Encoder for hydrological modeling
+    Memory-Augmented Transformer Encoder with learned T2V embedding
     """
-    def __init__(self, d_model, nhead, num_layers, 
-                 dropout=0.1, activation='relu'):
+    def __init__(
+        self, d_model, nhead, num_layers, memory_size, memory_dim, 
+        dropout=0.1, activation='relu'
+    ):
         super(MANNTransformerEncoder, self).__init__()
         self.d_model = d_model
-        # self.memory_size = memory_size
-        # self.memory_dim = memory_dim
+        self.memory_size = memory_size
+        self.memory_dim = memory_dim
         
-        # # Memory bank
-        # self.memory_bank = MemoryBank(memory_size, memory_dim, nhead)
+        # Memory bank
+        self.memory_bank = MemoryBank(memory_size, memory_dim, nhead)
         
-        # FIXED: Transformer layers with batch_first=True to avoid warning
+        # Transformer layers
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_feedforward=4*d_model, 
             dropout=dropout, activation=activation, batch_first=True
@@ -117,19 +104,44 @@ class MANNTransformerEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         
         # Memory integration layers
-        # self.memory_gate = nn.Linear(d_model + memory_dim, d_model)
-        # self.memory_proj = nn.Linear(d_model, memory_dim)
+        self.memory_gate = nn.Linear(d_model + memory_dim, d_model)
+        self.memory_proj = nn.Linear(d_model, memory_dim)
         
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model)
+        # Learned time-to-vector embedding
+        self.t2v = T2V(output_dim=d_model)
         
     def forward(self, src, src_mask=None):
         """
-        Forward pass with memory-augmented attention 
+        src: [batch_size, seq_len, d_model]
         """
-        src = self.pos_encoder(src)
+        B, L, D = src.size()
+        
+        # Build position indices 0..L-1 and expand
+        pos = torch.arange(L, device=src.device, dtype=src.dtype)
+        pos = pos.view(1, L, 1).expand(B, L, 1)
+        # Learned sinusoidal embedding
+        time_embed = self.t2v(pos)  # [B, L, d_model]
+        
+        # Add the learned positional embedding
+        src = src + time_embed
+        
+        # Transformer encoding
         encoded = self.transformer_encoder(src, src_mask)
-        return encoded, None 
+        
+        # Memory interaction
+        memory_enhanced = []
+        for t in range(L):
+            current = encoded[:, t, :]
+            mem_q = self.memory_proj(current)
+            mem_c, attn = self.memory_bank.read(mem_q)
+            combined = torch.cat([current, mem_c], dim=-1)
+            enhanced = self.memory_gate(combined)
+            memory_enhanced.append(enhanced)
+        
+        memory_enhanced = torch.stack(memory_enhanced, dim=1)
+        return memory_enhanced, attn
+
+
 
 class DischargePredictor(nn.Module):
     """
@@ -145,12 +157,9 @@ class DischargePredictor(nn.Module):
         self.input_projection = nn.Linear(input_dim, d_model)
         
         # MANN-Transformer encoder
-        # self.mann_transformer = MANNTransformerEncoder(
-        #     d_model, nhead, num_layers, memory_size, memory_dim, dropout
-        # )
         self.mann_transformer = MANNTransformerEncoder(
-    d_model, nhead, num_layers, dropout
-)
+            d_model, nhead, num_layers, memory_size, memory_dim, dropout
+        )
         
         # Output layers
         self.output_projection = nn.Sequential(
@@ -253,8 +262,7 @@ class HydrologicalDataset(Dataset):
         self.data['month'] = self.data.index.month / 12.0
         self.data['season_sin'] = np.sin(2 * np.pi * self.data.index.dayofyear / 365.0)
         self.data['season_cos'] = np.cos(2 * np.pi * self.data.index.dayofyear / 365.0)
-        self.data['discharge_diff_1'] = self.data['Discharge(m3/s)'].diff(1)
-        self.data['discharge_rolling_3'] = self.data['Discharge(m3/s)'].rolling(3).mean()
+        
         # Lag features
         for lag in [1, 7, 30, 365]:
             self.data[f'discharge_lag_{lag}'] = self.data['Discharge(m3/s)'].shift(lag)
@@ -385,11 +393,11 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
             support_y = task['support_y'].to(device)       # [support_size, 1]
             _, _, support_attention = model(support_x, return_attention=True)
             
-            # if batch_idx % memory_write_frequency == 0:
-            #     with torch.no_grad():
-            #         support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
-            #         for i in range(min(support_repr.size(0), 5)):
-            #             model.mann_transformer.memory_bank.write(support_repr[i])
+            if batch_idx % memory_write_frequency == 0:
+                with torch.no_grad():
+                    support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
+                    for i in range(min(support_repr.size(0), 5)):
+                        model.mann_transformer.memory_bank.write(support_repr[i])
             
             # --- Query set forward pass  ---
             query_x = task['query_x'].to(device)    # [query_size, seq_len, features]
