@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader, random_split
 import math
 from torch.nn import HuberLoss
 
@@ -72,11 +73,11 @@ class MemoryBank(nn.Module):
         if gate is None:
             gate = torch.sigmoid(torch.randn(1, device=content.device))
         _, least_used_idx = torch.min(self.usage, dim=0)
-        with torch.no_grad():
-            self.memory.data[least_used_idx] = (
+        # with torch.no_grad():
+        self.memory.data[least_used_idx] = (
                 gate * content + (1 - gate) * self.memory.data[least_used_idx]
             )
-            self.usage[least_used_idx] += 1
+        self.usage[least_used_idx] += 1
         return least_used_idx
 
 
@@ -129,16 +130,26 @@ class MANNTransformerEncoder(nn.Module):
         encoded = self.transformer_encoder(src, src_mask)
         
         # Memory interaction
-        memory_enhanced = []
-        for t in range(L):
-            current = encoded[:, t, :]
-            mem_q = self.memory_proj(current)
-            mem_c, attn = self.memory_bank.read(mem_q)
-            combined = torch.cat([current, mem_c], dim=-1)
-            enhanced = self.memory_gate(combined)
-            memory_enhanced.append(enhanced)
+        # memory_enhanced = []
+        # for t in range(L):
+        #     current = encoded[:, t, :]
+        #     mem_q = self.memory_proj(current)
+        #     mem_c, attn = self.memory_bank.read(mem_q)
+        #     combined = torch.cat([current, mem_c], dim=-1)
+        #     enhanced = self.memory_gate(combined)
+        #     memory_enhanced.append(enhanced)
         
-        memory_enhanced = torch.stack(memory_enhanced, dim=1)
+        # memory_enhanced = torch.stack(memory_enhanced, dim=1)
+        sequence_repr = encoded.mean(dim=1)  # [B, D]
+
+    # Project to memory query space
+        mem_q = self.memory_proj(sequence_repr)  # [B, memory_dim]
+        mem_c, attn = self.memory_bank.read(mem_q)  # [B, memory_dim], [B, memory_size]
+
+    # Optionally, concatenate memory content to each timestep
+        mem_c_expanded = mem_c.unsqueeze(1).expand(-1, L, -1)  # [B, L, memory_dim]
+        combined = torch.cat([encoded, mem_c_expanded], dim=-1)  # [B, L, D + memory_dim]
+        memory_enhanced = self.memory_gate(combined)
         return memory_enhanced, attn
 
 
@@ -199,43 +210,8 @@ class DischargePredictor(nn.Module):
         if return_attention:
             return discharge_pred, uncertainty, attention_weights
         return discharge_pred, uncertainty
-    
-
-    # Uncertainty estimation
-        uncertainty = torch.exp(self.uncertainty_head(final_state))
-
-        if return_attention:
-            return discharge_pred, uncertainty, attention_weights
-        return discharge_pred, uncertainty
-
-    # def forward(self, x, return_attention=False):
-    #     batch_size, seq_len, _ = x.size()
-    #     x_projected = self.input_projection(x)
-    #     encoded, attention_weights = self.mann_transformer(x_projected)
-    #     final_state = encoded[:, -1, :]
-
-    # # Output projection with activation monitoring
-    #     x_out = final_state
-    #     zero_fracs = []
-    #     neg_fracs = []
-    #     for module in self.output_projection:
-    #         x_out = module(x_out)
-    #         if isinstance(module, nn.LeakyReLU):
-    #             zero_frac = (x_out == 0).float().mean().item()
-    #             neg_frac = (x_out < 0).float().mean().item()
-    #             zero_fracs.append(zero_frac)
-    #             neg_fracs.append(neg_frac)
-    #             print(f"LeakyReLU: Zero activations={zero_frac:.4f}, Negative activations={neg_frac:.4f}")
-
-    #     discharge_pred = x_out
-    #     uncertainty = torch.exp(self.uncertainty_head(final_state))
-
-    #     if return_attention:
-    #         return discharge_pred, uncertainty, attention_weights
-    #     return discharge_pred, uncertainty
-
-  
-
+     
+     
 
 class HydrologicalDataset(Dataset):
     """
@@ -357,15 +333,112 @@ class HydrologicalDataset(Dataset):
         return tasks
 
 
+def plot_losses(train_losses, val_losses):
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Losses')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_curve.png')
+    plt.close()
+
+def plot_true_vs_pred(true_vals, pred_vals):
+    plt.figure(figsize=(8, 8))
+    plt.scatter(true_vals, pred_vals, alpha=0.5)
+    plt.plot([min(true_vals), max(true_vals)], [min(true_vals), max(true_vals)], 'r--')
+    plt.xlabel('True Discharge (m³/s)')
+    plt.ylabel('Predicted Discharge (m³/s)')
+    plt.title('True vs Predicted Discharge')
+    plt.grid(True)
+    plt.savefig('true_vs_pred.png')
+    plt.close()
+
+
+def plot_observed_vs_predicted(dates, observed, predicted):
+    plt.figure(figsize=(15, 8))
+    
+    # Convert dates to proper format if needed
+    if isinstance(dates[0], (int, float)):
+        # If dates are indices, create a simple range
+        x_axis = range(len(dates))
+        xlabel = 'Time (Days)'
+    else:
+        # If dates are actual dates
+        x_axis = dates
+        xlabel = 'Date'
+    
+    # Plot observed and predicted as clean lines
+    plt.plot(x_axis, observed, 'b-', label='Observed', linewidth=2, alpha=0.8)
+    plt.plot(x_axis, predicted, 'r-', label='Predicted', linewidth=2, alpha=0.8)
+    
+    # Calculate confidence interval (optional)
+    residuals = np.array(predicted) - np.array(observed)
+    std_residual = np.std(residuals)
+    upper_bound = np.array(predicted) + 1.96 * std_residual
+    lower_bound = np.array(predicted) - 1.96 * std_residual
+    
+    # Add confidence interval as shaded area
+    plt.fill_between(x_axis, lower_bound, upper_bound, 
+                     color='gray', alpha=0.3, label='Confidence Interval')
+    
+    plt.xlabel(xlabel)
+    plt.ylabel('Inflow (m³/s)')
+    plt.title('Observed vs Predicted Discharge Over Time')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Format x-axis if using actual dates
+    if not isinstance(dates[0], (int, float)):
+        plt.xticks(rotation=45)
+    
+    plt.tight_layout()
+    plt.savefig('obs_vs_pred_time.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+# Also add a function to limit data points for cleaner visualization
+def plot_observed_vs_predicted_limited(dates, observed, predicted, max_points=300):
+    """Plot with limited points for cleaner visualization"""
+    
+    # Limit to max_points for cleaner plot
+    if len(observed) > max_points:
+        step = len(observed) // max_points
+        dates = dates[::step]
+        observed = observed[::step]
+        predicted = predicted[::step]
+    
+    plt.figure(figsize=(15, 8))
+    
+    # Create time axis
+    x_axis = range(len(dates))
+    
+    # Plot as clean lines
+    plt.plot(x_axis, observed, 'b-', label='Observed', linewidth=2.5, alpha=0.9)
+    plt.plot(x_axis, predicted, 'r-', label='Predicted', linewidth=2.5, alpha=0.9)
+    
+    # Calculate and plot confidence interval
+    residuals = np.array(predicted) - np.array(observed)
+    std_residual = np.std(residuals)
+    upper_bound = np.array(predicted) + 1.96 * std_residual
+    lower_bound = np.array(predicted) - 1.96 * std_residual
+    
+    plt.fill_between(x_axis, lower_bound, upper_bound, 
+                     color='gray', alpha=0.3, label='Confidence Interval')
+    
+    plt.xlabel('Time (Days)')
+    plt.ylabel('Inflow (m³/s)')
+    plt.title('Observed vs Predicted Discharge Over Time')
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('obs_vs_pred_time_clean.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32, 
                           learning_rate=1e-4, device='cpu'):
-    """
-    Training loop that also prints, for each query example:
-      - the date,
-      - the actual (raw) discharge,
-      - the predicted (raw) discharge,
-      along with the batch loss.
-    """
     if device == 'cuda' and not torch.cuda.is_available():
         print("CUDA not available, using CPU instead")
         device = 'cpu'
@@ -373,12 +446,21 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
     model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+    huber_loss = nn.HuberLoss(delta=1.0)
     
-    # mse_loss = nn.MSELoss()
-    huber_loss = nn.HuberLoss(delta=1.0)  # delta is adjustable; 1.0 is standard
-
+    # Create validation split (20% of data)
+    val_size = int(0.2 * len(dataset))
+    train_size = len(dataset) - val_size
+    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    
     train_losses = []
+    val_losses = []
     memory_write_frequency = 10
+    
+    # For final plots
+    all_val_dates = []
+    all_val_true = []
+    all_val_pred = []
     
     for epoch in range(num_epochs):
         model.train()
@@ -388,30 +470,29 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
         for batch_idx, task in enumerate(few_shot_batches):
             optimizer.zero_grad()
             
-            # --- Support set forward pass (for memory writes) ---
-            support_x = task['support_x'].to(device)       # [support_size, seq_len, features]
-            support_y = task['support_y'].to(device)       # [support_size, 1]
+            # Support set processing
+            support_x = task['support_x'].to(device)
+            support_y = task['support_y'].to(device)
             _, _, support_attention = model(support_x, return_attention=True)
             
             if batch_idx % memory_write_frequency == 0:
                 with torch.no_grad():
-                    support_repr = torch.mean(support_attention, dim=0)  # [memory_size]
+                    support_repr = torch.mean(support_attention, dim=0)
                     for i in range(min(support_repr.size(0), 5)):
                         model.mann_transformer.memory_bank.write(support_repr[i])
             
-            # --- Query set forward pass  ---
-            query_x = task['query_x'].to(device)    # [query_size, seq_len, features]
-            query_y = task['query_y'].to(device)    # [query_size, 1]
-            query_dates = task['query_dates']       # list of length query_size
+            # Query set processing
+            query_x = task['query_x'].to(device)
+            query_y = task['query_y'].to(device)
+            query_dates = task['query_dates']
             
             query_pred, query_uncertainty = model(query_x)
             
-            # Compute losses
+            # Loss calculation
             support_loss = huber_loss(_, _.detach())
-             # we don’t need support_pred here
             query_loss = huber_loss(query_pred.squeeze(), query_y.squeeze())
             uncertainty_loss = torch.mean(query_uncertainty)
-            total_loss       = support_loss + query_loss + 0.1 * uncertainty_loss
+            total_loss = support_loss + query_loss + 0.1 * uncertainty_loss
             
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -419,28 +500,55 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
             
             epoch_losses.append(total_loss.item())
             
-            # --- Print date + true vs. predicted in raw discharge units ---
-            # First convert tensors to 1D Python lists (values on log1p scale)
-            true_log1p  = query_y.squeeze().detach().cpu().numpy().tolist()      # each=log1p(true)
-            pred_log1p  = query_pred.squeeze().detach().cpu().numpy().tolist()   # each=log1p(pred)
-            
-            # Invert log1p to get raw discharge: expm1(log1p(val)) = val_raw
+            # Convert to raw discharge
+            true_log1p = query_y.squeeze().detach().cpu().numpy().tolist()
+            pred_log1p = query_pred.squeeze().detach().cpu().numpy().tolist()
             true_raw = [float(np.expm1(v)) for v in true_log1p]
             pred_raw = [float(np.expm1(v)) for v in pred_log1p]
             
             print(f"Epoch {epoch}, Batch {batch_idx} — Loss: {total_loss.item():.6f}")
             for i, dt in enumerate(query_dates):
-                # Format date as YYYY-MM-DD
                 date_str = dt.strftime("%Y-%m-%d")
                 print(f"    {date_str}  |  True: {true_raw[i]:.4f}  →  Pred: {pred_raw[i]:.4f}")
-            print("")  # blank line between batches
+            print("")
+        
+        # Validation phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for i in range(len(val_dataset)):
+                features, target, date = val_dataset[i]
+                features = features.unsqueeze(0).to(device)
+                target = target.to(device)
+                pred, _ = model(features)
+                loss = huber_loss(pred.squeeze(), target.squeeze())
+
+                val_loss += loss.item()
+                
+                # Store for final plots
+                true_raw = float(np.expm1(target.item()))
+                pred_raw = float(np.expm1(pred.item()))
+                all_val_dates.append(date)
+                all_val_true.append(true_raw)
+                all_val_pred.append(pred_raw)
+        
+        avg_val_loss = val_loss / len(val_dataset)
+        val_losses.append(avg_val_loss)
+        
+        # Record training loss
+        avg_epoch_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        train_losses.append(avg_epoch_loss)
         
         scheduler.step()
-        avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
-        train_losses.append(avg_loss)
-        print(f"Epoch {epoch} complete. Avg Loss: {avg_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}\n")
+        print(f"Epoch {epoch} complete. Train Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}\n")
     
-    return train_losses
+    # Generate plots after training
+    plot_losses(train_losses, val_losses)
+    plot_true_vs_pred(all_val_true, all_val_pred)
+    plot_observed_vs_predicted_limited(all_val_dates, all_val_true, all_val_pred, max_points=300)
+    
+    return train_losses, val_losses
+
 
 
 def prepare_discharge_data(file_path):
@@ -485,9 +593,11 @@ if __name__ == "__main__":
         print(f"Using device: {device}")
         
         # Training with fixed implementation
-        train_losses = train_mann_transformer(model, dataset, num_epochs=20, device=device)
-        
+        train_losses, val_losses = train_mann_transformer(model, dataset, num_epochs=5, device=device)
+    
         print("Training completed successfully!")
-        print(f"Final loss: {train_losses[-1]:.6f}")
+        print(f"Final training loss: {train_losses[-1]:.6f}")
+        print(f"Final validation loss: {val_losses[-1]:.6f}")
+        
         
    
