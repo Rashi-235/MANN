@@ -7,6 +7,31 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Dataset, DataLoader, random_split
 import math
 from torch.nn import HuberLoss
+from sklearn.preprocessing import MinMaxScaler
+
+
+def nse(true, pred):
+    # Nash–Sutcliffe Efficiency: 1 - (Σ(e²)/Σ((t−t̄)²))
+    num = ((true - pred)**2).sum(axis=0)
+    den = ((true - true.mean(axis=0))**2).sum(axis=0)
+    return 1 - num/den
+
+def rsr(true, pred):
+    # Ratio of RMSE to standard deviation
+    rmse = np.sqrt(((true - pred)**2).mean(axis=0))
+    std  = np.std(true, axis=0)
+    return rmse / std
+
+def pbias(true, pred):
+    # Percent bias: 100 * Σ(pred - true) / Σ(true)
+    return 100.0 * ( (pred - true).sum(axis=0) / true.sum(axis=0) )
+
+def tpe(true, pred, eps=0.01):
+    # Clamp denominator so it never goes below eps
+    pct_err = np.abs((pred - true) / np.maximum(true, eps)) * 100
+    k = max(1, int(0.05 * len(pct_err)))
+    return np.sort(pct_err, axis=0)[-k:].mean(axis=0)
+
 
 
 class T2V(nn.Module):
@@ -229,24 +254,26 @@ class HydrologicalDataset(Dataset):
         
         # Lag features
         for lag in [1, 7, 30, 365]:
-            self.data[f'discharge_lag_{lag}'] = self.data['Discharge(m3/s)'].shift(lag)
+            self.data[f'discharge_lag_{lag}'] = self.data['Simga'].shift(lag)
         
         # Rolling statistics
         for window in [7, 30]:
             self.data[f'discharge_mean_{window}'] = (
-                self.data['Discharge(m3/s)'].rolling(window).mean()
+                self.data['Simga'].rolling(window).mean()
             )
             self.data[f'discharge_std_{window}'] = (
-                self.data['Discharge(m3/s)'].rolling(window).std()
+                self.data['Simga'].rolling(window).std()
             )
         # Feature columns
-        self.feature_cols = [col for col in self.data.columns if col != 'Discharge(m3/s)']
+        self.feature_cols = [c for c in self.data.columns 
+                     if c not in ('Simga','Simga_scaled')]
+
 
         for col in self.feature_cols:
             col_min = self.data[col].min()
             col_max = self.data[col].max()
             self.data[col] = (self.data[col] - col_min) / (col_max - col_min)
-
+        
         # Remove rows with NaN
         self.data = self.data.dropna()
         
@@ -256,27 +283,26 @@ class HydrologicalDataset(Dataset):
         return len(self.data) - self.sequence_length - self.prediction_horizon + 1
     
     def __getitem__(self, idx):
-        """
-        Return (features, target, target_date) for the window starting at idx.
-        """
-        start_idx = idx
-        end_idx = start_idx + self.sequence_length
-        
-        # Features (shape: [sequence_length, num_features])
-        features = self.data[self.feature_cols].iloc[start_idx:end_idx].values
-        
-        # Target index (one step ahead by prediction_horizon)
-        target_idx = end_idx + self.prediction_horizon - 1
-        target = self.data['Discharge(m3/s)'].iloc[target_idx]  # this is log1p(discharge)
-        
-        # Also grab the corresponding date label
-        target_date = self.data.index[target_idx]
-        
+        start = idx
+        end   = start + self.sequence_length
+
+        # 1) grab the input window
+        X = self.data[self.feature_cols].iloc[start:end].values
+
+        # 2) grab the next prediction_horizon steps as a vector
+        tgt_start = end
+        tgt_end   = end + self.prediction_horizon
+        Y = self.data['Simga_scaled'].iloc[tgt_start:tgt_end].values
+
+        # 3) grab the corresponding dates if you still want them
+        dates = list(self.data.index[tgt_start:tgt_end])
+
         return (
-            torch.FloatTensor(features),
-            torch.FloatTensor([target]),
-            target_date
+            torch.FloatTensor(X),             # (sequence_length, num_features)
+            torch.FloatTensor(Y),             # (prediction_horizon,)
+            dates                             # list of Timestamps, length prediction_horizon
         )
+
     
     def get_few_shot_batch(self, num_tasks=1):
         """
@@ -424,9 +450,28 @@ def plot_observed_vs_predicted_limited(dates, observed, predicted, max_points=30
     plt.savefig('obs_vs_pred_time_clean.png', dpi=300, bbox_inches='tight')
     plt.close()
 
+def compute_rmse(model, dataset, device='cpu'):
+    model.eval()
+    mse_sum = 0.0
+    count = 0
+    with torch.no_grad():
+        for features, target, _ in dataset:
+            # features: (seq_len, feat), target: (horizon,)
+            x = features.unsqueeze(0).to(device)   # [1, L, feat]
+            y_true = target.to(device)             # [horizon]
+            y_pred, _ = model(x)                   # [1, horizon]
+            y_pred = y_pred.squeeze(0)             # [horizon]
+            
+            err = y_pred - y_true                  # [horizon]
+            mse_sum += torch.sum(err * err).item()
+            count   += err.numel()
+    rmse = math.sqrt(mse_sum / count) if count>0 else float('nan')
+    return rmse
 
-def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32, 
-                          learning_rate=1e-4, device='cpu'):
+
+
+def train_mann_transformer(model, dataset, num_epochs=50, batch_size=32, 
+                          learning_rate=1e-5, device='cpu', patience=5, min_delta=1e-4):
     if device == 'cuda' and not torch.cuda.is_available():
         print("CUDA not available, using CPU instead")
         device = 'cpu'
@@ -437,12 +482,17 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
     huber_loss = nn.HuberLoss(delta=1.0)
     
     # Create validation split (20% of data)
-    val_size = int(0.2 * len(dataset))
-    train_size = len(dataset) - val_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+    total = len(dataset)
+    test_size = val_size = int(0.15 * total)
+    train_size = total - val_size - test_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
     
     train_losses = []
     val_losses = []
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    early_stop = False
+
     memory_write_frequency = 10
     
     # For final plots
@@ -489,36 +539,31 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
             epoch_losses.append(total_loss.item())
             
             # Convert to raw discharge
-            true_log1p = query_y.squeeze().detach().cpu().numpy().tolist()
-            pred_log1p = query_pred.squeeze().detach().cpu().numpy().tolist()
-            true_raw = [float(np.expm1(v)) for v in true_log1p]
-            pred_raw = [float(np.expm1(v)) for v in pred_log1p]
-            
-            # print(f"Epoch {epoch}, Batch {batch_idx} — Loss: {total_loss.item():.6f}")
-            # for i, dt in enumerate(query_dates):
-            #     date_str = dt.strftime("%Y-%m-%d")
-            #     print(f"    {date_str}  |  True: {true_raw[i]:.4f}  →  Pred: {pred_raw[i]:.4f}")
-            # print("")
+            true_log1p = query_y.squeeze().detach().cpu().numpy()
+            pred_log1p = query_pred.squeeze().detach().cpu().numpy()
+            true_raw = np.expm1(true_log1p).tolist()   # e.g. [12.3, 11.5, 10.2, 9.8, 9.1]
+            pred_raw = np.expm1(pred_log1p).tolist()
         
         # Validation phase
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for i in range(len(val_dataset)):
-                features, target, date = val_dataset[i]
+            for features, target, date in val_dataset:
                 features = features.unsqueeze(0).to(device)
-                target = target.to(device)
-                pred, _ = model(features)
-                loss = huber_loss(pred.squeeze(), target.squeeze())
+                target   = target.to(device)            # shape [5]
+                pred, _  = model(features)              # shape [1,5]
+                loss     = huber_loss(pred.squeeze(0), target)
 
                 val_loss += loss.item()
-                
-                # Store for final plots
-                true_raw = float(np.expm1(target.item()))
-                pred_raw = float(np.expm1(pred.item()))
-                all_val_dates.append(date)
-                all_val_true.append(true_raw)
-                all_val_pred.append(pred_raw)
+
+        # vector → raw
+                true_raw = np.expm1(target.cpu().numpy()).tolist()  # [t+1, t+2, …]
+                pred_raw = np.expm1(pred.squeeze(0).cpu().numpy()).tolist()
+
+        # keep only t+1
+                all_val_dates.append(date[0])
+                all_val_true.append(true_raw[0])
+                all_val_pred.append(pred_raw[0])
         
         avg_val_loss = val_loss / len(val_dataset)
         val_losses.append(avg_val_loss)
@@ -529,7 +574,53 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
         
         scheduler.step()
         print(f"Epoch {epoch} complete. Train Loss: {avg_epoch_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {scheduler.get_last_lr()[0]:.6f}\n")
+
+        if avg_val_loss < best_val_loss - min_delta:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch + 1}: no improvement in validation loss for {patience} epochs.")
+            early_stop = True
+            break
+
+
+    test_rmse = compute_rmse(model, test_dataset, device)
+    print(f"Overall Test RMSE: {test_rmse:.4f}")
     
+     # ——— STEP‑WISE HORIZON METRICS ———
+    all_true_vectors = []
+    all_pred_vectors = []
+    model.eval()
+    with torch.no_grad():
+        for features, target, _ in test_dataset:
+            # features: (30,5), target: (5,)
+            x = features.unsqueeze(0).to(device)  # (1,30,5)
+            pred_log1p, _ = model(x)              # (1,5)
+            # true_log1p = target.cpu().numpy()     # (5,)
+            # pred_log1p = pred_log1p.cpu().numpy().squeeze()  # (5,)
+            pred_scaled = pred.squeeze(0).cpu().numpy().reshape(-1,1)
+            pred_log1p  = target_scaler.inverse_transform(pred_scaled).flatten()
+            all_pred_vectors.append(np.expm1(pred_log1p))
+            true_scaled = target.cpu().numpy().reshape(-1,1)
+            true_log1p  = target_scaler.inverse_transform(true_scaled).flatten()
+            all_true_vectors.append(np.expm1(true_log1p))
+            # back to raw discharge
+            # all_true_vectors.append(np.expm1(true_log1p))
+            # all_pred_vectors.append(np.expm1(pred_log1p))
+
+    all_true = np.stack(all_true_vectors)  # (N,5)
+    all_pred = np.stack(all_pred_vectors)  # (N,5)
+
+    # compute and print your 5‐step metrics
+    print("NSE Values    :", np.round(nse(all_true,   all_pred),   4))
+    print("RSR Values    :", np.round(rsr(all_true,   all_pred),   4))
+    print("PBIAS (%)     :", np.round(pbias(all_true, all_pred),   4))
+    print("TPE (%)       :", np.round(tpe(all_true,   all_pred),   4))
+
+
     # Generate plots after training
     plot_losses(train_losses, val_losses)
     plot_true_vs_pred(all_val_true, all_val_pred)
@@ -542,27 +633,73 @@ def train_mann_transformer(model, dataset, num_epochs=100, batch_size=32,
 def prepare_discharge_data(file_path):
     """
     Prepare the discharge data for MANN-Transformer training
-    (now dropping any rows where 'Discharge(m3/s)' is NaN)
+    (now dropping any rows where 'Simga' is NaN)
     """
-    # Load data
+    # 1. Load
+    print("--- 1. Loading and Preparing Data for Prediction ---")
     data = pd.read_excel(file_path)
+    print("Successfully loaded data from Excel file.")
+
+    # 2. Check missing
+    missing_before = data.isna().sum().sum()
+    print(f"Missing values before imputation: {missing_before}")
+
+    # (if you do any imputation, do it here…)
+    # e.g. data.fillna(method="ffill", inplace=True)
+    missing_after = data.isna().sum().sum()
+    print(f"Missing values after imputation: {missing_after}\n")
+
+    # 3. Index and log‑transform
     data['Date'] = pd.to_datetime(data['Date'])
-    data = data.set_index('Date')
-    
-    # Drop rows with missing discharge values
-    data = data.dropna(subset=['Discharge(m3/s)'])
-    
-    # Log-transform for handling extreme values
-    data['Discharge(m3/s)'] = np.log1p(data['Discharge(m3/s)'])
-    
-    return data
+    data.set_index('Date', inplace=True)
+    data.sort_index(inplace=True)
+    data.dropna(subset=['Simga'], inplace=True)
+    data['Simga'] = np.log1p(data['Simga'])
+
+    target_scaler = MinMaxScaler()
+    data['Simga_scaled'] = target_scaler.fit_transform(data[['Simga']])
+
+    return data, target_scaler
 
 
 # Main execution with error handling
 if __name__ == "__main__":
         # Initialize model and dataset
-        data = prepare_discharge_data('DOC-20250406-WA0050..xlsx')
-        dataset = HydrologicalDataset(data, sequence_length=30, prediction_horizon=1)
+        # data = prepare_discharge_data('DOC-20250406-WA0050..xlsx')
+        df, target_scaler = prepare_discharge_data("Simga.xlsx")
+
+    # — split, smooth, scale —
+        print("--- 2. Splitting, Smoothing, and Scaling Data ---")
+        train_df = df['2000-06-01':'2010-09-30'].copy()
+        test_df  = df['2011-06-01':'2014-09-30'].copy()
+        print(f"Training data shape: {train_df.shape} "
+          f"(from {train_df.index.min()} to {train_df.index.max()})")
+        print(f"Testing data shape:  {test_df.shape} "
+          f"(from {test_df.index.min()} to {test_df.index.max()})")
+
+    # now scaling
+        from sklearn.preprocessing import MinMaxScaler
+        scaler = MinMaxScaler()
+        train_vals = scaler.fit_transform(train_df[['Simga']])
+        test_vals  = scaler.transform(test_df [['Simga']])
+        train_df['scaled'] = train_vals
+        test_df ['scaled'] = test_vals
+        print("Data scaling complete.\n")
+
+        horizon = 5
+        for h in range(1, horizon+1):
+            train_df[f"y_t+{h}"] = train_df['scaled'].shift(-h)
+            test_df [f"y_t+{h}"] = test_df ['scaled'].shift(-h)
+
+# now drop the trailing rows with NaNs in targets
+        train_df = train_df.iloc[:-horizon].copy()
+        test_df  = test_df.iloc[:-horizon].copy()
+
+        print("Multi‐step train shape:", train_df[[f"y_t+{h}" for h in range(1,horizon+1)]].shape)
+        print("Multi‐step test  shape:", test_df [[f"y_t+{h}" for h in range(1,horizon+1)]].shape)
+
+
+        dataset = HydrologicalDataset(df, sequence_length=30, prediction_horizon=5)
         
         # Model configuration
         input_dim = len(dataset.feature_cols)
@@ -573,7 +710,7 @@ if __name__ == "__main__":
             num_layers=6,
             memory_size=100,
             memory_dim=128,
-            output_dim=1
+            output_dim=5
         )
         
         # Automatic device detection
@@ -581,7 +718,7 @@ if __name__ == "__main__":
         print(f"Using device: {device}")
         
         # Training with fixed implementation
-        train_losses, val_losses = train_mann_transformer(model, dataset, num_epochs=5, device=device)
+        train_losses, val_losses = train_mann_transformer(model, dataset, num_epochs=50, device=device)
     
         print("Training completed successfully!")
         print(f"Final training loss: {train_losses[-1]:.6f}")
